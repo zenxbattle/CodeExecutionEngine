@@ -1,30 +1,21 @@
-# Stage 1: Builder Stage
 FROM golang:1.24.1-alpine AS builder
 
-# Set working directory
 WORKDIR /app
 
-# Copy Go module files and install dependencies
+RUN apk add --no-cache git
+RUN --mount=type=secret,id=GIT_AUTH_TOKEN \
+    git config --global url."https://oauth2:$(cat /run/secrets/GIT_AUTH_TOKEN)@github.com/".insteadOf "https://github.com/"
+
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Copy all source code
 COPY . .
+RUN go build -o /app/engine ./cmd
 
-# Build the Go binary
-RUN go build -o codeexecutionengine ./cmd
-
-# Stage 2: Final Stage (Minimal Image)
 FROM alpine:latest
 
-# Set working directory
 WORKDIR /app
-
-# Copy the built binary from the builder stage
-COPY --from=builder /app/codeexecutionengine .
-
-# Expose the necessary port
+COPY --from=builder /app/engine .
 EXPOSE 50053
 
-# Command to run the binary
-CMD ["./codeexecutionengine"]
+CMD ["./engine"]

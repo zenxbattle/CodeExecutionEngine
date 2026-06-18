@@ -4,15 +4,15 @@ import (
 	"os/exec"
 	"xcodeengine/config"
 	"xcodeengine/executor"
+	"xcodeengine/natsclient"
 	"xcodeengine/natshandler"
 
 	"log"
 	"strings"
 
-	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 
-	zap_betterstack "xcodeengine/logger"
+	"xcodeengine/logutil"
 )
 
 func main() {
@@ -35,13 +35,8 @@ func main() {
 	}
 	defer logger.Sync()
 
-	// Initialize BetterStackLogStreamer
-	logStreamer := zap_betterstack.NewBetterStackLogStreamer(
-		config.BetterStackSourceToken,
-		config.Environment,
-		config.BetterStackUploadURL,
-		logger,
-	)
+	// Initialize Logger
+	logShipper := logutil.New("code-execution-engine")
 
 	log.Println("Prepping Code Execution engine")
 
@@ -55,7 +50,7 @@ func main() {
 	log.Printf("Docker image '%s' found.", imageName)
 
 	log.Println("Starting worker pool initialization")
-	workerPool, err := executor.NewWorkerPool(2, 3, 400, 500,logStreamer) //workers, jobs, memory, vcpu,logstreamer
+	workerPool, err := executor.NewWorkerPool(2, 3, 400, 500,logShipper) //workers, jobs, memory, vcpu,logstreamer
 	if err != nil {
 		logger.Fatal("Failed to initialize worker pool",
 			zap.Error(err))
@@ -63,36 +58,24 @@ func main() {
 	log.Println("Worker pool initialized successfully")
 
 	// Connect to NATS
-	log.Printf("Connecting to NATS at: %s", config.NatsURL)
-	nc, err := nats.Connect(config.NatsURL)
+	nc, err := natsclient.NewClient(config.NatsURL)
 	if err != nil {
-		logger.Fatal("Failed to connect to NATS",
-			zap.String("url", config.NatsURL),
-			zap.Error(err))
+		log.Fatal(err)
 	}
 	defer nc.Close()
 	log.Println("Successfully connected to NATS")
 
 	// Subscribe to execution requests
 	log.Println("Subscribing to 'compiler.execute.request'")
-	_, err = nc.Subscribe("compiler.execute.request", func(msg *nats.Msg) {
+	nc.QueueSubscribe("compiler.execute.request", "engine-workers", func(data []byte) []byte {
 		log.Println("Received compiler.execute.request message")
-		natshandler.HandleCompilerRequest(msg, nc, workerPool)
+		return natshandler.HandleCompilerRequestBytes(data, workerPool)
 	})
-	if err != nil {
-		logger.Fatal("Failed to subscribe to compiler.execute.request",
-			zap.Error(err))
-	}
-
 	log.Println("Subscribing to 'problems.execute.request'")
-	_, err = nc.Subscribe("problems.execute.request", func(msg *nats.Msg) {
+	nc.QueueSubscribe("problems.execute.request", "engine-workers", func(data []byte) []byte {
 		log.Println("Received problems.execute.request message")
-		natshandler.HandleProblemRunRequest(msg, nc, workerPool)
+		return natshandler.HandleProblemRunRequestBytes(data, workerPool)
 	})
-	if err != nil {
-		logger.Fatal("Failed to subscribe to problems.execute.request",
-			zap.Error(err))
-	}
 
 	log.Println("Engine service is up and listening for requests")
 

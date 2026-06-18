@@ -18,9 +18,6 @@ type Config struct {
 	NatsURL        string
 
 	Environment string
-
-	BetterStackUploadURL   string
-	BetterStackSourceToken string
 }
 
 func LoadConfig() Config {
@@ -33,9 +30,6 @@ func LoadConfig() Config {
 		
 		NatsURL:        getEnv("NATSURL", "nats://localhost:4222"),
 		Environment:    getEnv("ENVIRONMENT", "production"),
-
-		BetterStackUploadURL:   getEnv("BETTERSTACKUPLOADURL", ""),
-		BetterStackSourceToken: getEnv("BETTERSTACKSOURCETOKEN", ""),
 	}
 }
 

@@ -16,3 +16,8 @@ server.log
 
 
 /tmp/main
+
+# Local dev artifacts
+tmp/
+build-errors.log
+

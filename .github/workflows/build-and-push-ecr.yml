@@ -1,0 +1,55 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      actions: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Generate GH App Token for GitOps bot
+        id: generate-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.GITOPS_BOT_APP_ID }}
+          private-key: ${{ secrets.GITOPS_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::056562102950:role/github-actions-ecr-role
+          aws-region: ap-south-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: 056562102950.dkr.ecr.ap-south-1.amazonaws.com/codeexecutionengine:${{ github.sha }}
+          secrets: |
+            "GIT_AUTH_TOKEN=${{ steps.generate-token.outputs.token }}"
+
+      - name: Gitops Action
+        uses: zenxbattle/gitops-action@main
+        if: github.event_name != 'pull_request'
+        with:
+          app_id: ${{ vars.GITOPS_BOT_APP_ID }}
+          installation_id: ${{ vars.GITOPS_BOT_INSTALLATION_ID }}
+          private_key: ${{ secrets.GITOPS_BOT_PRIVATE_KEY }}
