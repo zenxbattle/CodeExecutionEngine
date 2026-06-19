@@ -12,6 +12,7 @@ import (
 	"xcodeengine/model"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/client"
 	"github.com/fatih/color"
 	logrus "github.com/sirupsen/logrus"
@@ -55,17 +56,18 @@ type ContainerManager struct {
 	maxWorkers   int
 	memorylimit  int64
 	cpunanolimit int64
+	workerImage  string
 }
 
 // NewContainerManager creates a new container manager
-func NewContainerManager(maxWorkers int, memorylimit, cpunanolimit int64) (*ContainerManager, error) {
+func NewContainerManager(workerImage string, maxWorkers int, memorylimit, cpunanolimit int64) (*ContainerManager, error) {
 	dockerClient, err := client.NewClientWithOpts(
 		client.FromEnv,
-		client.WithVersion("1.45"),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create Docker client: %v", err)
 	}
+	dockerClient.NegotiateAPIVersion(context.Background())
 
 	logger := logrus.New()
 
@@ -96,6 +98,7 @@ func NewContainerManager(maxWorkers int, memorylimit, cpunanolimit int64) (*Cont
 		maxWorkers:   maxWorkers,
 		memorylimit:  memorylimit,
 		cpunanolimit: cpunanolimit,
+		workerImage:  workerImage,
 	}, nil
 }
 
@@ -119,6 +122,10 @@ func (h *fileHook) Fire(entry *logrus.Entry) error {
 
 // InitializePool ensures the correct number of containers are running
 func (cm *ContainerManager) InitializePool() error {
+	if err := cm.pullImageWithRetry(); err != nil {
+		cm.logger.WithFields(logrus.Fields{"image": cm.workerImage, "error": err}).Warn("Failed to pull worker image, will retry on container create")
+	}
+
 	containers, err := cm.dockerClient.ContainerList(context.Background(), container.ListOptions{All: true})
 	if err != nil {
 		cm.logger.WithFields(logrus.Fields{"error": err}).Error("Failed to list containers")
@@ -127,7 +134,7 @@ func (cm *ContainerManager) InitializePool() error {
 
 	// Register existing worker containers
 	for _, c := range containers {
-		if c.Image == "lijuthomas/worker" {
+		if c.Image == cm.workerImage {
 			state := StateIdle
 			if c.State != "running" {
 				state = StateError
@@ -167,6 +174,25 @@ func (cm *ContainerManager) InitializePool() error {
 	return nil
 }
 
+func (cm *ContainerManager) pullImageWithRetry() error {
+	ctx := context.Background()
+	var lastErr error
+	for i := 0; i < 5; i++ {
+		reader, err := cm.dockerClient.ImagePull(ctx, cm.workerImage, image.PullOptions{})
+		if err != nil {
+			lastErr = err
+			cm.logger.WithFields(logrus.Fields{"attempt": i + 1, "error": err}).Warn("Failed to pull worker image, retrying...")
+			time.Sleep(time.Duration(i+1) * 2 * time.Second)
+			continue
+		}
+		io.Copy(io.Discard, reader)
+		reader.Close()
+		cm.logger.WithFields(logrus.Fields{"image": cm.workerImage}).Info("Worker image pulled successfully")
+		return nil
+	}
+	return lastErr
+}
+
 // StartContainer creates and starts a new worker container
 func (cm *ContainerManager) StartContainer() error {
 	ctx := context.Background()
@@ -180,7 +206,7 @@ func (cm *ContainerManager) StartContainer() error {
 	cm.mu.Unlock()
 
 	config := &container.Config{
-		Image: "lijuthomas/worker",
+		Image: cm.workerImage,
 		Tty:   true,
 	}
 
@@ -292,7 +318,7 @@ func (cm *ContainerManager) checkHealth() {
 
 	runningWorkers := make(map[string]bool)
 	for _, c := range containers {
-		if c.Image == "lijuthomas/worker" {
+		if c.Image == cm.workerImage {
 			if _, exists := cm.containers[c.ID]; exists {
 				if cm.containers[c.ID].State != StateError {
 					runningWorkers[c.ID] = true

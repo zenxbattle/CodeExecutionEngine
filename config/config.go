@@ -10,14 +10,22 @@ import (
 
 type Config struct {
 	MaxWorkers int
+	AutoSpawn  bool
 	JobCount   int
 	// URL            string
 	Ratelimit      int
 	RatelimitBurst int
-	Port           string
+	WorkerImage    string
 	NatsURL        string
-
-	Environment string
+	Environment    string
+	WorkerCPU      int // millicores per worker (autospawn calc)
+	WorkerMem      int // MB per worker (autospawn calc)
+	WorkerMemLimit int64 // MB passed to container create
+	WorkerCPULimit int64 // millicores passed to container create
+	Port           string
+	ShowOutput     bool
+	MaxRequestsPerMin int
+	BanDurationSec    int
 }
 
 func LoadConfig() Config {
@@ -27,10 +35,30 @@ func LoadConfig() Config {
 	}
 
 	return Config{
-		
+		MaxWorkers:     getEnvInt("MAX_WORKERS", 0),
+		AutoSpawn:      getEnvBool("AUTO_SPAWN", false),
+		JobCount:       getEnvInt("MAX_JOBS", 3),
+		WorkerImage:    getEnv("WORKER_IMAGE", "lijuthomas/zenxbattle-engine-worker:latest"),
 		NatsURL:        getEnv("NATSURL", "nats://localhost:4222"),
 		Environment:    getEnv("ENVIRONMENT", "production"),
+		WorkerCPU:      getEnvInt("WORKER_CPU", 500),
+		WorkerMem:      getEnvInt("WORKER_MEM", 400),
+		WorkerMemLimit: int64(getEnvInt("WORKER_MEM_LIMIT", 400)),
+		WorkerCPULimit: int64(getEnvInt("WORKER_CPU_LIMIT", 500)),
+		Port:           getEnv("PORT", "50053"),
+		ShowOutput:     getEnvBool("SHOW_OUTPUT", false),
+		MaxRequestsPerMin: getEnvInt("MAX_REQUESTS_PER_MIN", 10),
+		BanDurationSec:    getEnvInt("BAN_DURATION_SEC", 60),
 	}
+}
+
+func CalcAutoMaxWorkers(podCPU, podMem, workerCPU, workerMem int) int {
+	byCPU := int(float64(podCPU) * 0.8 / float64(workerCPU))
+	byMem := int(float64(podMem) * 0.8 / float64(workerMem))
+	if m := min(byCPU, byMem); m > 0 {
+		return m
+	}
+	return 1
 }
 
 func getEnv(key, defaultValue string) string {
@@ -47,4 +75,12 @@ func getEnvInt(key string, defaultValue int) int {
 		}
 	}
 	return defaultValue
+}
+
+func getEnvBool(key string, defaultVal bool) bool {
+	v, ok := os.LookupEnv(key)
+	if !ok {
+		return defaultVal
+	}
+	return v == "true" || v == "1"
 }

@@ -1,32 +1,31 @@
 package main
 
 import (
-	"os/exec"
-	"xcodeengine/config"
-	"xcodeengine/executor"
-	"xcodeengine/natsclient"
-	"xcodeengine/natshandler"
-
+	"encoding/json"
+	"fmt"
 	"log"
-	"strings"
+	"net"
+	"os"
+	"strconv"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
-
+	"xcodeengine/config"
+	"xcodeengine/executor"
 	"xcodeengine/logutil"
+	"xcodeengine/natsclient"
+	"xcodeengine/natshandler"
 )
 
 func main() {
-
-	// Load configuration
 	log.Println("Loading engine configuration...")
-	config := config.LoadConfig()
-	log.Printf("Loaded config: %+v\n", config)
+	cfg := config.LoadConfig()
+	log.Printf("Loaded config: %+v\n", cfg)
 
-	// Initialize Zap logger based on environmentcan u provid
 	var logger *zap.Logger
 	var err error
-	if config.Environment == "development" {
+	if cfg.Environment == "development" {
 		logger, err = zap.NewDevelopment()
 	} else {
 		logger, err = zap.NewProduction()
@@ -36,33 +35,32 @@ func main() {
 	}
 	defer logger.Sync()
 
-	// Initialize Logger
 	logShipper := logutil.New("code-execution-engine")
+	log.Printf("Using worker image: %s", cfg.WorkerImage)
 
-	log.Println("Prepping Code Execution engine")
-
-	// Check if the worker image exists
-	imageName := "lijuthomas/worker"
-	log.Printf("Checking if Docker image '%s' exists locally...", imageName)
-	if !checkIfDockerImageExists(imageName) {
-		logger.Fatal("Worker Docker image not found. Exiting...",
-			zap.String("image", imageName))
+	// Autospawn: if MAX_WORKERS=0, calculate from pod resources
+	if cfg.MaxWorkers == 0 {
+		if cfg.AutoSpawn {
+			podCPU := getEnvInt("POD_CPU_LIMIT", 2000)
+			podMem := getEnvInt("POD_MEM_LIMIT", 2048)
+			cfg.MaxWorkers = config.CalcAutoMaxWorkers(podCPU, podMem, cfg.WorkerCPU, cfg.WorkerMem)
+			log.Printf("autospawn: calculated maxWorkers=%d", cfg.MaxWorkers)
+		} else {
+			cfg.MaxWorkers = 1
+		}
 	}
-	log.Printf("Docker image '%s' found.", imageName)
 
 	log.Println("Starting worker pool initialization")
-	workerPool, err := executor.NewWorkerPool(2, 3, 400, 500,logShipper) //workers, jobs, memory, vcpu,logstreamer
+	workerPool, err := executor.NewWorkerPool(cfg.WorkerImage, cfg.MaxWorkers, cfg.JobCount, cfg.WorkerMemLimit, cfg.WorkerCPULimit, logShipper)
 	if err != nil {
-		logger.Fatal("Failed to initialize worker pool",
-			zap.Error(err))
+		logger.Fatal("Failed to initialize worker pool", zap.Error(err))
 	}
 	log.Println("Worker pool initialized successfully")
 
-	// Connect to NATS with retry
 	var nc *natsclient.Client
 	for {
 		var err error
-		nc, err = natsclient.NewClient(config.NatsURL)
+		nc, err = natsclient.NewClient(cfg.NatsURL)
 		if err == nil {
 			break
 		}
@@ -72,51 +70,70 @@ func main() {
 	defer nc.Close()
 	log.Println("Successfully connected to NATS")
 
-	// Subscribe to execution requests
+	rateLimiter := executor.NewRateLimiter(cfg.MaxRequestsPerMin, 60, cfg.BanDurationSec)
+	defer rateLimiter.Stop()
+
+	rateLimitResp := func(clientIP string) []byte {
+		rem := rateLimiter.CooldownRemaining(clientIP)
+		resp, _ := json.Marshal(map[string]interface{}{
+			"success":       false,
+			"error":         "rate_limit_exceeded",
+			"status_message": fmt.Sprintf("Too many requests. Try again in %ds.", int(rem.Seconds())),
+			"execution_time": "0ms",
+		})
+		return resp
+	}
+
 	log.Println("Subscribing to 'compiler.execute.request'")
-	nc.QueueSubscribe("compiler.execute.request", "engine-workers", func(data []byte) []byte {
+	nc.Conn.QueueSubscribe("compiler.execute.request", "engine-workers", func(msg *nats.Msg) {
 		log.Println("Received compiler.execute.request message")
-		return natshandler.HandleCompilerRequestBytes(data, workerPool)
+		clientIP := msg.Header.Get("X-Client-IP")
+		if cfg.MaxRequestsPerMin > 0 && !rateLimiter.Allow(clientIP) {
+			msg.Respond(rateLimitResp(clientIP))
+			return
+		}
+		resp := natshandler.HandleCompilerRequestBytes(msg.Data, workerPool, cfg.ShowOutput)
+		msg.Respond(resp)
 	})
 	log.Println("Subscribing to 'problems.execute.request'")
-	nc.QueueSubscribe("problems.execute.request", "engine-workers", func(data []byte) []byte {
+	nc.Conn.QueueSubscribe("problems.execute.request", "engine-workers", func(msg *nats.Msg) {
 		log.Println("Received problems.execute.request message")
-		return natshandler.HandleProblemRunRequestBytes(data, workerPool)
+		clientIP := msg.Header.Get("X-Client-IP")
+		if cfg.MaxRequestsPerMin > 0 && !rateLimiter.Allow(clientIP) {
+			msg.Respond(rateLimitResp(clientIP))
+			return
+		}
+		resp := natshandler.HandleProblemRunRequestBytes(msg.Data, workerPool, cfg.ShowOutput)
+		msg.Respond(resp)
 	})
 
 	log.Println("Engine service is up and listening for requests")
 
-	// Keep the service running
+	addr := fmt.Sprintf(":%s", cfg.Port)
+	listener, err := net.Listen("tcp", addr)
+	if err != nil {
+		logger.Warn("Failed to start health listener", zap.String("port", cfg.Port), zap.Error(err))
+	} else {
+		go func() {
+			log.Printf("Health listener started on %s", addr)
+			for {
+				conn, err := listener.Accept()
+				if err != nil {
+					return
+				}
+				conn.Close()
+			}
+		}()
+	}
+
 	select {}
 }
 
-// checkIfDockerImageExists checks if a Docker image exists locally
-func checkIfDockerImageExists(imageName string) bool {
-	printAllWorkerImages() // print all workers before checking
-	cmd := exec.Command("docker", "images", "-q", imageName)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Println("Error checking Docker image:", err)
-		return false
-	}
-	imageID := strings.TrimSpace(string(output))
-	log.Printf("Image ID for '%s': %s", imageName, imageID)
-	return imageID != ""
-}
-
-// printAllWorkerImages prints all existing images with 'worker' in the name
-func printAllWorkerImages() {
-	log.Println("Listing all local Docker images containing 'worker':")
-	cmd := exec.Command("docker", "images")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Println("Error listing Docker images:", err)
-		return
-	}
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		if strings.Contains(line, "worker") {
-			log.Println(line)
+func getEnvInt(key string, defaultVal int) int {
+	if v, ok := os.LookupEnv(key); ok {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
 		}
 	}
+	return defaultVal
 }

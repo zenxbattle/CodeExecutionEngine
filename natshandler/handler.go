@@ -9,14 +9,14 @@ import (
 	"xcodeengine/model"
 )
 
-func HandleCompilerRequest(msg []byte, workerPool *executor.WorkerPool) []byte {
+func HandleCompilerRequest(msg []byte, workerPool *executor.WorkerPool, showOutput bool) []byte {
 	var req model.CompilerRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
 		log.Printf("Failed to parse execution request: %v", err)
 		return nil
 	}
 
-	compilerService := service.NewCompilerService(workerPool)
+	compilerService := service.NewCompilerService(workerPool, showOutput)
 
 	res, err := compilerService.Compile(req.Code, req.Language)
 	if err != nil {
@@ -28,14 +28,14 @@ func HandleCompilerRequest(msg []byte, workerPool *executor.WorkerPool) []byte {
 	return resData
 }
 
-func HandleProblemRunRequest(msg []byte, workerPool *executor.WorkerPool) []byte {
+func HandleProblemRunRequest(msg []byte, workerPool *executor.WorkerPool, showOutput bool) []byte {
 	var req model.ProblemExecutionRequest
 	if err := json.Unmarshal(msg, &req); err != nil {
 		log.Printf("Failed to parse execution request: %v", err)
 		return nil
 	}
 
-	compilerService := service.NewCompilerService(workerPool)
+	compilerService := service.NewCompilerService(workerPool, showOutput)
 
 	res, err := compilerService.ExecuteProblemCode(req.Code, req.Language)
 	if err != nil {
@@ -47,10 +47,10 @@ func HandleProblemRunRequest(msg []byte, workerPool *executor.WorkerPool) []byte
 	return resData
 }
 
-func HandleCompilerRequestBytes(data []byte, workerPool *executor.WorkerPool) []byte {
-	return HandleCompilerRequest(data, workerPool)
+func HandleCompilerRequestBytes(data []byte, workerPool *executor.WorkerPool, showOutput bool) []byte {
+	return HandleCompilerRequest(data, workerPool, showOutput)
 }
 
-func HandleProblemRunRequestBytes(data []byte, workerPool *executor.WorkerPool) []byte {
-	return HandleProblemRunRequest(data, workerPool)
+func HandleProblemRunRequestBytes(data []byte, workerPool *executor.WorkerPool, showOutput bool) []byte {
+	return HandleProblemRunRequest(data, workerPool, showOutput)
 }

@@ -29,8 +29,8 @@ type WorkerPool struct {
 }
 
 // NewWorkerPool initializes a new worker pool
-func NewWorkerPool(maxWorkers, maxJobCount int, memorylimit, cpunanolimit int64, lokiShipper *logutil.Logger) (*WorkerPool, error) {
-	containerMgr, err := NewContainerManager(maxWorkers, memorylimit, cpunanolimit)
+func NewWorkerPool(workerImage string, maxWorkers, maxJobCount int, memorylimit, cpunanolimit int64, lokiShipper *logutil.Logger) (*WorkerPool, error) {
+	containerMgr, err := NewContainerManager(workerImage, maxWorkers, memorylimit, cpunanolimit)
 	if err != nil {
 		log.Printf("error initializing container manager: %v", err)
 		return nil, err

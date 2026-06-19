@@ -32,11 +32,13 @@ type CompilerResponse struct {
 
 type CompilerService struct {
 	WorkerPool *executor.WorkerPool
+	ShowOutput bool
 }
 
-func NewCompilerService(workerPool *executor.WorkerPool) *CompilerService {
+func NewCompilerService(workerPool *executor.WorkerPool, showOutput bool) *CompilerService {
 	return &CompilerService{
 		WorkerPool: workerPool,
+		ShowOutput: showOutput,
 	}
 }
 
@@ -158,7 +160,9 @@ func (s *CompilerService) ExecuteProblemCode(code string, language string) (*com
 
 	// Execute code using worker pool
 	result := s.WorkerPool.ExecuteJob(language, code)
-	fmt.Println("Execution result:", result)
+	if s.ShowOutput {
+		fmt.Println("Execution result:", result)
+	}
 
 	if result.Error != nil {
 		return &compilergrpc.CompileResponse{
