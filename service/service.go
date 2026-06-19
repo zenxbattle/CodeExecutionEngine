@@ -6,10 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"xcodeengine/executor"
-	"xcodeengine/internal"
-
-	compilergrpc "github.com/lijuuu/GlobalProtoXcode/Compiler"
+	"zenxbattle/executor"
+	"zenxbattle/internal"
 )
 
 var (
@@ -91,7 +89,7 @@ func normalizeLanguage(lang string) string {
 	return lang
 }
 
-func (s *CompilerService) Compile(code string, language string) (*compilergrpc.CompileResponse, error) {
+func (s *CompilerService) Compile(code string, language string) (*CompilerResponse, error) {
 	start := time.Now()
 
 	// Normalize the language string
@@ -99,7 +97,7 @@ func (s *CompilerService) Compile(code string, language string) (*compilergrpc.C
 
 	codeBytes, err := base64.StdEncoding.DecodeString(code)
 	if err != nil {
-		return &compilergrpc.CompileResponse{
+		return &CompilerResponse{
 			Success:       false,
 			Error:         err.Error(),
 			StatusMessage: "Failed to decode base64",
@@ -108,22 +106,18 @@ func (s *CompilerService) Compile(code string, language string) (*compilergrpc.C
 
 	code = string(codeBytes)
 
-	// Sanitize code
 	if err := internal.SanitizeCode(code, language, 10000); err != nil {
-		return &compilergrpc.CompileResponse{
+		return &CompilerResponse{
 			Success:       false,
 			Error:         err.Error(),
 			StatusMessage: err.Error(),
 		}, nil
 	}
 
-	// fmt.Println(code)
-
-	// Execute code using worker pool
 	result := s.WorkerPool.ExecuteJob(language, code)
 
 	if result.Error != nil {
-		return &compilergrpc.CompileResponse{
+		return &CompilerResponse{
 			Success:       false,
 			Error:         result.Error.Error(),
 			Output:        result.Output,
@@ -131,7 +125,7 @@ func (s *CompilerService) Compile(code string, language string) (*compilergrpc.C
 		}, nil
 	}
 
-	return &compilergrpc.CompileResponse{
+	return &CompilerResponse{
 		Success:       true,
 		Output:        result.Output,
 		ExecutionTime: time.Since(start).String(),
@@ -139,7 +133,7 @@ func (s *CompilerService) Compile(code string, language string) (*compilergrpc.C
 	}, nil
 }
 
-func (s *CompilerService) ExecuteProblemCode(code string, language string) (*compilergrpc.CompileResponse, error) {
+func (s *CompilerService) ExecuteProblemCode(code string, language string) (*CompilerResponse, error) {
 	start := time.Now()
 
 	// Normalize the language string
@@ -150,7 +144,7 @@ func (s *CompilerService) ExecuteProblemCode(code string, language string) (*com
 
 	// Sanitize code
 	if err := internal.SanitizeCode(code, language, 1000000000000); err != nil {
-		return &compilergrpc.CompileResponse{
+		return &CompilerResponse{
 			Success:       false,
 			Output:        "",
 			Error:         err.Error(),
@@ -158,14 +152,13 @@ func (s *CompilerService) ExecuteProblemCode(code string, language string) (*com
 		}, nil
 	}
 
-	// Execute code using worker pool
 	result := s.WorkerPool.ExecuteJob(language, code)
 	if s.ShowOutput {
 		fmt.Println("Execution result:", result)
 	}
 
 	if result.Error != nil {
-		return &compilergrpc.CompileResponse{
+		return &CompilerResponse{
 			Success:       false,
 			Error:         result.Error.Error(),
 			Output:        result.Output,
@@ -173,9 +166,7 @@ func (s *CompilerService) ExecuteProblemCode(code string, language string) (*com
 		}, nil
 	}
 
-	// fmt.Println("Output:", result.Output)
-
-	return &compilergrpc.CompileResponse{
+	return &CompilerResponse{
 		Success:       true,
 		Output:        result.Output,
 		ExecutionTime: time.Since(start).String(),

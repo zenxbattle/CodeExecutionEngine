@@ -11,11 +11,11 @@ import (
 
 	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
-	"xcodeengine/config"
-	"xcodeengine/executor"
-	"xcodeengine/logutil"
-	"xcodeengine/natsclient"
-	"xcodeengine/natshandler"
+	"zenxbattle/config"
+	"zenxbattle/executor"
+	"zenxbattle/logutil"
+	"zenxbattle/natsclient"
+	"zenxbattle/natshandler"
 )
 
 func main() {
