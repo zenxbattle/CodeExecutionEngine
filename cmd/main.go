@@ -9,6 +9,7 @@ import (
 
 	"log"
 	"strings"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -57,10 +58,16 @@ func main() {
 	}
 	log.Println("Worker pool initialized successfully")
 
-	// Connect to NATS
-	nc, err := natsclient.NewClient(config.NatsURL)
-	if err != nil {
-		log.Fatal(err)
+	// Connect to NATS with retry
+	var nc *natsclient.Client
+	for {
+		var err error
+		nc, err = natsclient.NewClient(config.NatsURL)
+		if err == nil {
+			break
+		}
+		log.Printf("Failed to connect to NATS: %v, retrying...", err)
+		time.Sleep(3 * time.Second)
 	}
 	defer nc.Close()
 	log.Println("Successfully connected to NATS")
