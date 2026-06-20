@@ -1,0 +1,54 @@
+7337
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: code-engine
+  namespace: xcode
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: code-engine
+  template:
+    metadata:
+      labels:
+        app: code-engine
+    spec:
+      containers:
+      - name: code-engine
+        image: lijuthomas/code-engine:latest
+        imagePullPolicy: Always
+        envFrom:
+        - configMapRef:
+            name: xcode-config
+        - secretRef:
+            name: xcode-secrets
+        env:
+        - name: NATSURL
+          value: "nats://nats:4222"
+        volumeMounts:
+        - name: docker-sock
+          mountPath: /var/run/docker.sock
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+      volumes:
+      - name: docker-sock
+        hostPath:
+          path: /var/run/docker.sock
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: code-engine
+  namespace: xcode
+spec:
+  selector:
+    app: code-engine
+  ports:
+  - port: 50053
+    targetPort: 50053
