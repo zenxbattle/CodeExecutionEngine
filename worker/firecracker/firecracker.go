@@ -1,7 +1,14 @@
 package firecracker
 
 import (
+	"bufio"
+	"context"
+	"encoding/base64"
 	"fmt"
+	"io"
+	"os"
+	"os/exec"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -19,21 +26,18 @@ type FCPool struct {
 }
 
 func NewPool(cfg worker.Config) (*FCPool, error) {
-	if cfg.MaxWorkers <= 0 {
-		cfg.MaxWorkers = 2 // microVMs are heavier
-	}
-	return &FCPool{
-		cfg:      cfg,
-		jobs:     make(chan worker.Job, cfg.MaxWorkers*4),
-		shutdown: make(chan struct{}),
-	}, nil
+	if cfg.MaxWorkers <= 0 { cfg.MaxWorkers = 2 }
+	return &FCPool{jobs: make(chan worker.Job, cfg.MaxWorkers*4), shutdown: make(chan struct{}), cfg: cfg}, nil
 }
 
 func (p *FCPool) Initialize() error {
-	for i := 0; i < p.cfg.MaxWorkers; i++ {
-		p.wg.Add(1)
-		go p.worker(i)
+	if _, err := os.Stat("/var/lib/firecracker/vmlinux"); err != nil {
+		return fmt.Errorf("firecracker kernel not found")
 	}
+	if _, err := os.Stat("/var/lib/firecracker/worker-rootfs.ext4"); err != nil {
+		return fmt.Errorf("firecracker rootfs not found")
+	}
+	for i := 0; i < p.cfg.MaxWorkers; i++ { p.wg.Add(1); go p.worker(i) }
 	return nil
 }
 
@@ -45,50 +49,68 @@ func (p *FCPool) ExecuteJob(language, code string) (worker.Result, error) {
 		r := <-result
 		return r, r.Error
 	default:
-		return worker.Result{}, fmt.Errorf("job queue full")
+		return worker.Result{}, fmt.Errorf("fc queue full")
 	}
 }
 
-func (p *FCPool) Shutdown() error {
-	close(p.shutdown)
-	p.wg.Wait()
-	return nil
-}
-
-func (p *FCPool) Stats() worker.PoolStats {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.stats.ActiveWorkers = p.cfg.MaxWorkers
-	p.stats.QueuedJobs = len(p.jobs)
-	return p.stats
-}
+func (p *FCPool) Shutdown() error { close(p.shutdown); p.wg.Wait(); return nil }
+func (p *FCPool) Stats() worker.PoolStats { return p.stats }
 
 func (p *FCPool) worker(id int) {
 	defer p.wg.Done()
+
+	// Boot one microVM per worker - communicate via stdin/stdout
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	tmpFile := fmt.Sprintf("/tmp/fc-config-%d.json", id)
+	os.WriteFile(tmpFile, []byte(fmt.Sprintf(
+		`{"boot-source":{"kernel_image_path":"/var/lib/firecracker/vmlinux","boot_args":"console=ttyS0 reboot=k panic=1 pci=off init=/init"},"drives":[{"drive_id":"rootfs","path_on_host":"/var/lib/firecracker/worker-rootfs.ext4","is_root_device":true,"is_read_only":false}],"machine-config":{"vcpu_count":1,"mem_size_mib":256,"smt":false}}`,
+	)), 0644)
+	defer os.Remove(tmpFile)
+
+	cmd := exec.CommandContext(ctx, "firecracker", "--no-api", "--config-file", tmpFile)
+	stdout, _ := cmd.StdoutPipe()
+	stdin, _ := cmd.StdinPipe()
+	cmd.Stderr = nil
+	cmd.Start()
+
+	// Wait for VM to boot
+	buf := bufio.NewScanner(stdout)
+	for buf.Scan() {
+		if strings.Contains(buf.Text(), "Freeing unused kernel") {
+			break
+		}
+	}
+
+	p.stats.ActiveWorkers++
+	defer func() { p.stats.ActiveWorkers-- }()
+
+	// Process jobs
 	for {
 		select {
 		case job := <-p.jobs:
-			result := p.executeMicroVM(job.Language, job.Code)
-			job.Result <- result
+			codeB64 := base64.StdEncoding.EncodeToString([]byte(job.Code))
+			start := time.Now()
+			io.WriteString(stdin, codeB64+"\n")
+
+			var result string
+			for buf.Scan() {
+				line := buf.Text()
+				if strings.HasPrefix(line, "FC_RESULT:") {
+					result = strings.TrimPrefix(line, "FC_RESULT:")
+					break
+				}
+			}
+
+			job.Result <- worker.Result{
+				Output:        strings.TrimSpace(result),
+				Success:       true,
+				ExecutionTime: time.Since(start),
+			}
 		case <-p.shutdown:
+			cancel()
 			return
 		}
-	}
-}
-
-func (p *FCPool) executeMicroVM(language, code string) worker.Result {
-	// TODO: Implement Firecracker microVM execution
-	// Steps:
-	// 1. Create rootfs overlay from base image
-	// 2. Write code into rootfs
-	// 3. Boot microVM with firecracker
-	// 4. Capture stdout
-	// 5. Kill microVM
-	// 6. Cleanup overlay
-	return worker.Result{
-		Output:  fmt.Sprintf("Firecracker worker: %s execution queued (microVM boot takes ~125ms)", language),
-		Success: true,
-		Error:   nil,
-		ExecutionTime: time.Duration(0),
 	}
 }
