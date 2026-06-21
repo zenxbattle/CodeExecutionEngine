@@ -1,76 +1,143 @@
-7337
-package vsock
+package firecracker
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
-	"os"
-	"syscall"
 	"time"
 )
 
-// Firecracker vsock uses SCM_CREDENTIALS with (cid << 32 | port) in PID field
+const (
+	DefaultVsockPort   = 5000
+	DefaultGuestCID    = 3
+	VsockHandshakeTimeout = 5 * time.Second
+	VsockRequestTimeout    = 30 * time.Second
+)
 
-type Conn struct {
-	conn net.Conn
-	fd   int
+type VsockClient struct {
+	udsPath string
+	port    uint32
 }
 
-func Dial(udsPath string, guestCID, guestPort uint32) (*Conn, error) {
-	conn, err := net.DialTimeout("unix", udsPath, 5*time.Second)
+func NewVsockClient(udsPath string, port uint32) *VsockClient {
+	return &VsockClient{udsPath: udsPath, port: port}
+}
+
+// connect creates a vsock connection through Firecracker's UDS
+// using the CONNECT <port>\n handshake protocol
+func (vc *VsockClient) connect() (net.Conn, error) {
+	conn, err := net.DialTimeout("unix", vc.udsPath, VsockHandshakeTimeout)
 	if err != nil {
-		return nil, fmt.Errorf("vsock dial: %w", err)
-	}
-	return &Conn{conn: conn}, nil
-}
-
-func (c *Conn) Write(data []byte) (int, error) {
-	unixConn, ok := c.conn.(*net.UnixConn)
-	if !ok {
-		return 0, fmt.Errorf("not a unix connection")
+		return nil, fmt.Errorf("dial UDS %s: %w", vc.udsPath, err)
 	}
 
-	f, err := unixConn.File()
+	// Firecracker vsock handshake
+	handshake := fmt.Sprintf("CONNECT %d\n", vc.port)
+	if _, err := conn.Write([]byte(handshake)); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("send CONNECT: %w", err)
+	}
+
+	// Read response: "OK <payload>\n"
+	resp := make([]byte, 128)
+	n, err := conn.Read(resp)
 	if err != nil {
-		return 0, err
+		conn.Close()
+		return nil, fmt.Errorf("read CONNECT resp: %w", err)
 	}
-	defer f.Close()
-	fd := int(f.Fd())
 
-	// The destination CID/port is encoded in the ancillary data
-	// Firecracker expects (cid << 32 | port) in the PID field of ucred
-	// But actually Firecracker vsock uses a simple binary header: [cid:4][port:4][len:4]
-	// Let's try both approaches
+	if n < 2 || string(resp[:2]) != "OK" {
+		conn.Close()
+		return nil, fmt.Errorf("vsock handshake failed: %q", string(resp[:n]))
+	}
 
-	// First try: simple binary header approach
-	header := make([]byte, 12)
-	binary.LittleEndian.PutUint32(header[0:4], 3)    // guest CID
-	binary.LittleEndian.PutUint32(header[4:8], 5555) // guest port
-	binary.LittleEndian.PutUint32(header[8:12], uint32(len(data)))
-
-	msg := append(header, data...)
-	return syscall.Write(fd, msg)
+	return conn, nil
 }
 
-func (c *Conn) Read(buf []byte) (int, error) {
-	return c.conn.Read(buf)
+// req is the guest-runner request format
+type executeReq struct {
+	TraceID string `json:"trace_id"`
+	Lang    string `json:"lang"`
+	Code    string `json:"code"`
+	Timeout int    `json:"timeout"`
 }
 
-func (c *Conn) Close() error {
-	return c.conn.Close()
+// resp is the guest-runner response format
+type executeResp struct {
+	Stdout        string `json:"stdout"`
+	Stderr        string `json:"stderr"`
+	ExitCode      int    `json:"exit_code"`
+	ExecutionTime int64  `json:"execution_time"`
+	Error         string `json:"error,omitempty"`
+	TimedOut      bool   `json:"timed_out,omitempty"`
 }
 
-// Simple approach: use socat via shell (fallback)
-func SendViaSocat(udsPath, data string) error {
-	f, err := os.OpenFile(udsPath, os.O_RDWR, 0)
+// Execute sends a code execution request via vsock and returns the result.
+// Returns wall-clock duration and the parsed response.
+func (vc *VsockClient) Execute(lang, code string, timeoutSec int) (*executeResp, time.Duration, error) {
+	conn, err := vc.connect()
+	if err != nil {
+		return nil, 0, fmt.Errorf("vsock connect: %w", err)
+	}
+	defer conn.Close()
+
+	req := executeReq{
+		TraceID: fmt.Sprintf("tr-%d", time.Now().UnixNano()),
+		Lang:    lang,
+		Code:    code,
+		Timeout: timeoutSec,
+	}
+
+	data, err := json.Marshal(&req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("marshal request: %w", err)
+	}
+
+	// Write length-prefixed JSON (4 bytes big-endian)
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(data)))
+
+	deadline := time.Now().Add(VsockRequestTimeout)
+	conn.SetDeadline(deadline)
+
+	if _, err := conn.Write(lenBuf); err != nil {
+		return nil, 0, fmt.Errorf("write len: %w", err)
+	}
+	if _, err := conn.Write(data); err != nil {
+		return nil, 0, fmt.Errorf("write req: %w", err)
+	}
+
+	// Read response length
+	if _, err := io.ReadFull(conn, lenBuf); err != nil {
+		return nil, 0, fmt.Errorf("read resp len: %w", err)
+	}
+	respLen := binary.BigEndian.Uint32(lenBuf)
+	if respLen > 1024*1024 { // 1MB sanity cap
+		return nil, 0, fmt.Errorf("response too large: %d", respLen)
+	}
+
+	// Read response body
+	respData := make([]byte, respLen)
+	if _, err := io.ReadFull(conn, respData); err != nil {
+		return nil, 0, fmt.Errorf("read resp: %w", err)
+	}
+
+	var result executeResp
+	if err := json.Unmarshal(respData, &result); err != nil {
+		return nil, 0, fmt.Errorf("unmarshal resp: %w", err)
+	}
+
+	return &result, time.Until(deadline), nil
+}
+
+// Ping checks if the guest runner is alive
+func (vc *VsockClient) Ping() error {
+	conn, err := vc.connect()
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-
-	// Firecracker vsock UDS: write destination CID/port via sendmsg
-	// As fallback, just write raw data and see if it works
-	_, err = f.Write([]byte(data))
-	return err
+	conn.Close()
+	return nil
 }
