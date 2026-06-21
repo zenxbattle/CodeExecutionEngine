@@ -33,6 +33,7 @@ RUN apk add --no-cache \
     python3 \
     nodejs \
     bash \
+    g++ \
     tini \
     && rm -rf /var/cache/apk/*
 
