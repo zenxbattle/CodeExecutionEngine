@@ -1,139 +1,73 @@
 package main
 
 import (
-	"encoding/json"
-	"fmt"
 	"log"
-	"net"
 	"os"
-	"strconv"
-	"time"
+	"os/signal"
+	"syscall"
 
-	"github.com/nats-io/nats.go"
-	"go.uber.org/zap"
 	"zenxbattle/config"
-	"zenxbattle/executor"
-	"zenxbattle/logutil"
 	"zenxbattle/natsclient"
 	"zenxbattle/natshandler"
+	"zenxbattle/worker"
+	workerdocker "zenxbattle/worker/docker"
+	workerfc "zenxbattle/worker/firecracker"
 )
 
 func main() {
-	log.Println("Loading engine configuration...")
 	cfg := config.LoadConfig()
-	log.Printf("Loaded config: %+v\n", cfg)
+	log.Printf("Loaded config: %+v", cfg)
 
-	var logger *zap.Logger
+	wCfg := worker.Config{
+		Image:       cfg.WorkerImage,
+		MaxWorkers:  cfg.MaxWorkers,
+		MemoryLimit: cfg.WorkerMemLimit,
+		CPULimit:    cfg.WorkerCPULimit,
+	}
+
+	if cfg.AutoSpawn {
+		wCfg.MaxWorkers = config.CalcAutoMaxWorkers(2000, 2048, cfg.WorkerCPU, cfg.WorkerMem)
+		log.Printf("autospawn: calculated maxWorkers=%d", wCfg.MaxWorkers)
+	}
+
+	var pool worker.WorkerPool
 	var err error
-	if cfg.Environment == "development" {
-		logger, err = zap.NewDevelopment()
-	} else {
-		logger, err = zap.NewProduction()
+
+	switch cfg.WorkerType {
+	case "firecracker":
+		pool, err = workerfc.NewPool(wCfg)
+		log.Println("Using Firecracker worker")
+	default:
+		pool, err = workerdocker.NewPool(wCfg)
+		log.Println("Using Docker worker")
 	}
+
 	if err != nil {
-		panic("Failed to initialize Zap logger: " + err.Error())
+		log.Fatalf("Failed to create worker pool: %v", err)
 	}
-	defer logger.Sync()
-
-	logShipper := logutil.New("code-execution-engine")
-	log.Printf("Using worker image: %s", cfg.WorkerImage)
-
-	// Autospawn: if MAX_WORKERS=0, calculate from pod resources
-	if cfg.MaxWorkers == 0 {
-		if cfg.AutoSpawn {
-			podCPU := getEnvInt("POD_CPU_LIMIT", 2000)
-			podMem := getEnvInt("POD_MEM_LIMIT", 2048)
-			cfg.MaxWorkers = config.CalcAutoMaxWorkers(podCPU, podMem, cfg.WorkerCPU, cfg.WorkerMem)
-			log.Printf("autospawn: calculated maxWorkers=%d", cfg.MaxWorkers)
-		} else {
-			cfg.MaxWorkers = 1
-		}
+	if err := pool.Initialize(); err != nil {
+		log.Fatalf("Failed to initialize: %v", err)
 	}
+	log.Println("Worker pool initialized")
 
-	log.Println("Starting worker pool initialization")
-	workerPool, err := executor.NewWorkerPool(cfg.WorkerImage, cfg.MaxWorkers, cfg.JobCount, cfg.WorkerMemLimit, cfg.WorkerCPULimit, logShipper)
+	nc, err := natsclient.Connect(cfg.NatsURL)
 	if err != nil {
-		logger.Fatal("Failed to initialize worker pool", zap.Error(err))
-	}
-	log.Println("Worker pool initialized successfully")
-
-	var nc *natsclient.Client
-	for {
-		var err error
-		nc, err = natsclient.NewClient(cfg.NatsURL)
-		if err == nil {
-			break
-		}
-		log.Printf("Failed to connect to NATS: %v, retrying...", err)
-		time.Sleep(3 * time.Second)
+		log.Fatalf("Failed to connect to NATS: %v", err)
 	}
 	defer nc.Close()
-	log.Println("Successfully connected to NATS")
 
-	rateLimiter := executor.NewRateLimiter(cfg.MaxRequestsPerMin, 60, cfg.BanDurationSec)
-	defer rateLimiter.Stop()
+	natshandler.StartHandlers(nc, pool, cfg.ShowOutput)
 
-	rateLimitResp := func(clientIP string) []byte {
-		rem := rateLimiter.CooldownRemaining(clientIP)
-		resp, _ := json.Marshal(map[string]interface{}{
-			"success":       false,
-			"error":         "rate_limit_exceeded",
-			"status_message": fmt.Sprintf("Too many requests. Try again in %ds.", int(rem.Seconds())),
-			"execution_time": "0ms",
-		})
-		return resp
-	}
+	// Health endpoint
+	go func() {
+		// TODO: HTTP health server on cfg.Port
+	}()
 
-	log.Println("Subscribing to 'compiler.execute.request'")
-	nc.Conn.QueueSubscribe("compiler.execute.request", "engine-workers", func(msg *nats.Msg) {
-		log.Println("Received compiler.execute.request message")
-		clientIP := msg.Header.Get("X-Client-IP")
-		if cfg.MaxRequestsPerMin > 0 && !rateLimiter.Allow(clientIP) {
-			msg.Respond(rateLimitResp(clientIP))
-			return
-		}
-		resp := natshandler.HandleCompilerRequestBytes(msg.Data, workerPool, cfg.ShowOutput)
-		msg.Respond(resp)
-	})
-	log.Println("Subscribing to 'problems.execute.request'")
-	nc.Conn.QueueSubscribe("problems.execute.request", "engine-workers", func(msg *nats.Msg) {
-		log.Println("Received problems.execute.request message")
-		clientIP := msg.Header.Get("X-Client-IP")
-		if cfg.MaxRequestsPerMin > 0 && !rateLimiter.Allow(clientIP) {
-			msg.Respond(rateLimitResp(clientIP))
-			return
-		}
-		resp := natshandler.HandleProblemRunRequestBytes(msg.Data, workerPool, cfg.ShowOutput)
-		msg.Respond(resp)
-	})
+	log.Printf("Engine ready [type=%s workers=%d]", cfg.WorkerType, wCfg.MaxWorkers)
 
-	log.Println("Engine service is up and listening for requests")
-
-	addr := fmt.Sprintf(":%s", cfg.Port)
-	listener, err := net.Listen("tcp", addr)
-	if err != nil {
-		logger.Warn("Failed to start health listener", zap.String("port", cfg.Port), zap.Error(err))
-	} else {
-		go func() {
-			log.Printf("Health listener started on %s", addr)
-			for {
-				conn, err := listener.Accept()
-				if err != nil {
-					return
-				}
-				conn.Close()
-			}
-		}()
-	}
-
-	select {}
-}
-
-func getEnvInt(key string, defaultVal int) int {
-	if v, ok := os.LookupEnv(key); ok {
-		if n, err := strconv.Atoi(v); err == nil {
-			return n
-		}
-	}
-	return defaultVal
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	<-sig
+	log.Println("Shutting down...")
+	pool.Shutdown()
 }

@@ -3,54 +3,37 @@ package natshandler
 import (
 	"encoding/json"
 	"log"
-	"zenxbattle/executor"
-	"zenxbattle/service"
 
+	"github.com/nats-io/nats.go"
 	"zenxbattle/model"
+	"zenxbattle/service"
+	"zenxbattle/worker"
 )
 
-func HandleCompilerRequest(msg []byte, workerPool *executor.WorkerPool, showOutput bool) []byte {
-	var req model.CompilerRequest
-	if err := json.Unmarshal(msg, &req); err != nil {
-		log.Printf("Failed to parse execution request: %v", err)
-		return nil
-	}
+func StartHandlers(nc *nats.Conn, pool worker.WorkerPool, showOutput bool) {
+	svc := service.NewCompilerService(pool, showOutput)
 
-	compilerService := service.NewCompilerService(workerPool, showOutput)
+	nc.Subscribe("compiler.execute.request", func(msg *nats.Msg) {
+		var req model.CompilerRequest
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			log.Printf("Failed to parse: %v", err)
+			return
+		}
+		res := svc.Execute(req.Code, req.Language)
+		resData, _ := json.Marshal(res)
+		msg.Respond(resData)
+	})
 
-	res, err := compilerService.Compile(req.Code, req.Language)
-	if err != nil {
-		log.Printf("Failed to compile code: %v", err)
-		return nil
-	}
+	nc.Subscribe("problems.execute.request", func(msg *nats.Msg) {
+		var req model.CompilerRequest
+		if err := json.Unmarshal(msg.Data, &req); err != nil {
+			log.Printf("Failed to parse: %v", err)
+			return
+		}
+		res := svc.Execute(req.Code, req.Language)
+		resData, _ := json.Marshal(res)
+		msg.Respond(resData)
+	})
 
-	resData, _ := json.Marshal(res)
-	return resData
-}
-
-func HandleProblemRunRequest(msg []byte, workerPool *executor.WorkerPool, showOutput bool) []byte {
-	var req model.ProblemExecutionRequest
-	if err := json.Unmarshal(msg, &req); err != nil {
-		log.Printf("Failed to parse execution request: %v", err)
-		return nil
-	}
-
-	compilerService := service.NewCompilerService(workerPool, showOutput)
-
-	res, err := compilerService.ExecuteProblemCode(req.Code, req.Language)
-	if err != nil {
-		log.Printf("Failed to compile code: %v", err)
-		return nil
-	}
-
-	resData, _ := json.Marshal(res)
-	return resData
-}
-
-func HandleCompilerRequestBytes(data []byte, workerPool *executor.WorkerPool, showOutput bool) []byte {
-	return HandleCompilerRequest(data, workerPool, showOutput)
-}
-
-func HandleProblemRunRequestBytes(data []byte, workerPool *executor.WorkerPool, showOutput bool) []byte {
-	return HandleProblemRunRequest(data, workerPool, showOutput)
+	log.Println("NATS handlers started: compiler.execute.request, problems.execute.request")
 }

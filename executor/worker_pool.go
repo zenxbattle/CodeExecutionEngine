@@ -2,6 +2,7 @@ package executor
 
 import (
 	"bytes"
+	"strings"
 	"context"
 	"fmt"
 	"log"
@@ -207,7 +208,8 @@ func (p *WorkerPool) executeCode(containerID, language, code string) (string, bo
 	}()
 
 	var output bytes.Buffer
-	cmd := exec.CommandContext(ctx, "docker", append([]string{"exec", containerID}, config.Args(code)...)...)
+	cmd := exec.CommandContext(ctx, "docker", append([]string{"exec", containerID}, config.Commands...)...)
+	cmd.Stdin = strings.NewReader(code)
 	cmd.Stdout = &output
 	cmd.Stderr = &output
 
